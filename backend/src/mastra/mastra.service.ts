@@ -57,27 +57,20 @@ export class MastraService {
     return null;
   }
 
-  // 🔧 NEW: Split content into chunks
   private splitIntoChunks(
     content: string,
     chunkSize: number = 12000,
   ): string[] {
     const chunks: string[] = [];
-
-    // Try to split by paragraphs first (more natural breaks)
     const paragraphs = content.split(/\n\n+/);
-
     let currentChunk = "";
 
     for (const paragraph of paragraphs) {
-      // If adding this paragraph would exceed chunk size
       if (currentChunk.length + paragraph.length > chunkSize) {
-        // Save current chunk if it's not empty
         if (currentChunk.trim()) {
           chunks.push(currentChunk.trim());
         }
 
-        // If single paragraph is too large, split it by sentences
         if (paragraph.length > chunkSize) {
           const sentences = paragraph.split(/\. +/);
           currentChunk = "";
@@ -100,7 +93,6 @@ export class MastraService {
       }
     }
 
-    // Add remaining content
     if (currentChunk.trim()) {
       chunks.push(currentChunk.trim());
     }
@@ -108,7 +100,6 @@ export class MastraService {
     return chunks;
   }
 
-  // 🔧 NEW: Generate questions from entire document
   async generateQuizQuestions(
     content: string,
     count: number = 10,
@@ -117,11 +108,9 @@ export class MastraService {
     this.logger.log(`📚 Processing ${content.length} characters of content`);
     this.logger.log(`🎯 Target: ${count} ${difficulty} questions`);
 
-    // Split content into chunks
     const chunks = this.splitIntoChunks(content, 12000);
     this.logger.log(`📄 Split content into ${chunks.length} chunk(s)`);
 
-    // Calculate questions per chunk (distribute evenly)
     const questionsPerChunk = Math.ceil(count / chunks.length);
     const allQuestions: QuizQuestion[] = [];
 
@@ -129,7 +118,6 @@ export class MastraService {
       const chunkNum = i + 1;
       const isLastChunk = i === chunks.length - 1;
 
-      // For last chunk, generate remaining questions
       const questionsNeeded = isLastChunk
         ? count - allQuestions.length
         : questionsPerChunk;
@@ -155,7 +143,6 @@ export class MastraService {
           `✅ Chunk ${chunkNum}: Generated ${chunkQuestions.length} questions. Total: ${allQuestions.length}/${count}`,
         );
 
-        // Small delay between chunks to avoid rate limits
         if (i < chunks.length - 1 && chunks.length > 1) {
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
@@ -164,9 +151,8 @@ export class MastraService {
           `⚠️ Failed to generate questions from chunk ${chunkNum}: ${error.message}`,
         );
 
-        // Continue with other chunks instead of failing completely
         if (allQuestions.length === 0 && i === chunks.length - 1) {
-          throw error; // Only throw if we got no questions at all
+          throw error;
         }
       }
     }
@@ -182,7 +168,45 @@ export class MastraService {
     return allQuestions;
   }
 
-  // 🔧 MODIFIED: Generate questions from a single chunk
+  // 🔧 IMPROVED: Better prompts for each difficulty level
+  private getDifficultyPrompt(difficulty: "easy" | "medium" | "hard"): string {
+    switch (difficulty) {
+      case "easy":
+        return `
+DIFFICULTY: EASY
+- Test basic recall and understanding
+- Questions should be straightforward but not trivial
+- Wrong options should be clearly incorrect upon careful reading
+- Avoid trick questions
+- Example: "What is X?" or "Which of the following describes Y?"`;
+
+      case "medium":
+        return `
+DIFFICULTY: MEDIUM  
+- Test application and analysis of concepts
+- Require students to understand relationships between ideas
+- Wrong options should be plausible but distinguishable with careful thought
+- May include scenario-based questions
+- Mix terminology, concepts, and application
+- Example: "If X occurs, what is the most likely result?" or "How does A relate to B?"`;
+
+      case "hard":
+        return `
+DIFFICULTY: HARD
+- Test deep understanding, synthesis, and critical thinking
+- Create DECEPTIVE distractors that seem correct at first glance
+- All wrong options MUST be highly plausible and closely related to the topic
+- Include subtle differences between options
+- Test edge cases, exceptions, and nuanced distinctions
+- Avoid obvious extremes or absurd options
+- Students should need to carefully distinguish between similar concepts
+- Mix common misconceptions as wrong answers
+- Example wrong options:
+  ✅ GOOD: "Mitosis produces two diploid cells" vs "Meiosis produces two diploid cells" (subtle difference)
+  ❌ BAD: "Mitosis produces two diploid cells" vs "Mitosis produces bananas" (obviously wrong)`;
+    }
+  }
+
   private async generateQuestionsFromChunk(
     content: string,
     count: number,
@@ -214,7 +238,7 @@ export class MastraService {
         const model = genAI.getGenerativeModel({
           model: this.modelName,
           generationConfig: {
-            temperature: 0.7,
+            temperature: 0.8, // 🔧 Increased for more creative distractors
             topP: 0.95,
             topK: 40,
             maxOutputTokens: 8192,
@@ -226,32 +250,81 @@ export class MastraService {
             ? `\n\nNOTE: This is section ${chunkNum} of ${totalChunks} from a larger document. Generate questions specifically from THIS section.`
             : "";
 
-        const prompt = `
-You are an expert educator. Generate EXACTLY ${count} multiple-choice questions in valid JSON format.
+        // 🔧 IMPROVED: Much better prompt with difficulty-specific instructions
+        const prompt = `You are an expert exam writer creating CBT (Computer-Based Test) questions for professional certification exams.
 
 CONTENT (Section ${chunkNum}/${totalChunks}):
 ${content}${contextInfo}
 
-REQUIREMENTS:
-1. Generate questions that cover DIFFERENT topics from this section
-2. Exactly 4 options per question
-3. Difficulty: ${difficulty}
-4. correctAnswer must be 0, 1, 2, or 3 (index of correct option)
-5. Return ONLY a valid JSON array, NO markdown, NO backticks, NO extra text
-6. Ensure questions are diverse and cover various aspects of the content
+${this.getDifficultyPrompt(difficulty)}
 
-STRICT JSON FORMAT:
+CRITICAL REQUIREMENTS FOR DISTRACTORS (Wrong Answers):
+${
+  difficulty === "hard"
+    ? `
+⚠️ HARD MODE - CREATE CHALLENGING DISTRACTORS:
+1. ALL wrong options must be plausible and closely related to the correct answer
+2. Use common misconceptions as wrong answers
+3. Include partially correct statements that are subtly wrong
+4. Test fine distinctions between similar concepts
+5. Avoid obviously wrong answers like unrelated terms
+6. Make students think carefully - no "gimme" questions
+7. Wrong answers should only be distinguishable with deep understanding
+
+GOOD EXAMPLE (Hard):
+Question: "What is the primary function of the rough endoplasmic reticulum?"
+✅ Correct: "Synthesis and modification of proteins destined for secretion"
+✅ Good Distractor: "Synthesis and modification of all cellular proteins" (too broad - plausible misconception)
+✅ Good Distractor: "Lipid synthesis and detoxification" (that's smooth ER - common confusion)
+✅ Good Distractor: "Protein synthesis and packaging into vesicles" (mixing ER and Golgi functions)
+
+BAD EXAMPLE (Too Easy):
+❌ Bad Distractor: "Converting sunlight to energy" (obviously wrong - that's chloroplasts)
+❌ Bad Distractor: "Storing genetic information" (obviously wrong - that's nucleus)
+`
+    : difficulty === "medium"
+      ? `
+📊 MEDIUM MODE - BALANCED CHALLENGE:
+1. Mix obviously wrong and plausible distractors (2 plausible, 1 clearly wrong)
+2. Include one option that's close but not quite right
+3. Test understanding of relationships between concepts
+4. Options should require reading the question carefully
+`
+      : `
+📖 EASY MODE - CLEAR BUT NOT TRIVIAL:
+1. One clearly wrong option is acceptable
+2. Other options should still require basic understanding
+3. Focus on testing recall and basic comprehension
+4. Avoid trick questions
+`
+}
+
+STRICT JSON FORMAT - EXACTLY ${count} QUESTIONS:
 [
   {
-    "question": "What is the main concept discussed in this section?",
-    "options": ["Concept A", "Concept B", "Concept C", "Concept D"],
+    "question": "Clear, specific question about the content",
+    "options": [
+      "First option (mix the position of correct answer)",
+      "Second option (plausible distractor)", 
+      "Third option (plausible distractor)",
+      "Fourth option (${difficulty === "hard" ? "highly plausible distractor" : "clearly wrong or plausible distractor"})"
+    ],
     "correctAnswer": 2,
-    "explanation": "The correct answer is C because...",
+    "explanation": "Detailed explanation why this is correct AND why others are wrong",
     "difficulty": "${difficulty}"
   }
 ]
 
-Generate exactly ${count} diverse questions from this section now:`;
+ADDITIONAL REQUIREMENTS:
+1. Cover DIFFERENT topics from this section
+2. Exactly 4 options per question
+3. correctAnswer must be 0, 1, 2, or 3 (index, NOT the letter A/B/C/D)
+4. Return ONLY valid JSON - NO markdown, NO backticks, NO extra text
+5. Questions should be concise but clear
+6. Avoid questions that can be answered without reading the content
+7. Randomize the position of the correct answer (don't always put it in the same position)
+
+Generate EXACTLY ${count} challenging ${difficulty} questions now:`;
 
         const result = await model.generateContent(prompt);
         const response = await result.response;
@@ -261,7 +334,6 @@ Generate exactly ${count} diverse questions from this section now:`;
           `  ✅ API key #${index + 1} responded (${text.length} chars)`,
         );
 
-        // Clean and parse the response
         text = this.cleanJsonResponse(text);
         const questions = this.parseQuestions(text, count);
         this.validateQuestions(questions, count);
