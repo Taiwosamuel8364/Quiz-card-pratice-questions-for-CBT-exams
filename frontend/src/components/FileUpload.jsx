@@ -18,6 +18,7 @@ export const FileUpload = ({ onUploadComplete, token }) => {
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState("");
   const [message, setMessage] = useState({ type: "", text: "" });
+  const [questions, setQuestions] = useState([]);
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
@@ -30,6 +31,15 @@ export const FileUpload = ({ onUploadComplete, token }) => {
         });
         return;
       }
+
+      if (selectedFile.size > 41943040) {
+        setMessage({
+          type: "error",
+          text: "File size exceeds 40MB limit",
+        });
+        return;
+      }
+
       setFile(selectedFile);
       setMessage({ type: "", text: "" });
     }
@@ -46,8 +56,20 @@ export const FileUpload = ({ onUploadComplete, token }) => {
       return;
     }
 
+    if (!token) {
+      console.error("❌ No token available!");
+      setMessage({
+        type: "error",
+        text: "You are not logged in. Please login first.",
+      });
+      return;
+    }
+
+    console.log("✅ Token exists:", token.substring(0, 20) + "...");
+
     setUploading(true);
     setProgress(0);
+    setQuestions([]);
     setMessage({ type: "", text: "" });
 
     const formData = new FormData();
@@ -56,89 +78,117 @@ export const FileUpload = ({ onUploadComplete, token }) => {
     formData.append("questionCount", questionCount.toString());
     formData.append("difficulty", difficulty);
 
-    // Simulate progress for better UX
-    const progressInterval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 90) {
-          clearInterval(progressInterval);
-          return 90;
-        }
-        return prev + 10;
-      });
-    }, 500);
-
-    // Update status messages
-    const statusMessages = [
-      "📄 Reading your file...",
-      "🧠 Analyzing content...",
-      "✨ Generating quiz questions...",
-      "🎯 Crafting explanations...",
-      "🔍 Ensuring full coverage...",
-      "⚡ Almost ready...",
-    ];
-
-    let messageIndex = 0;
-    const messageInterval = setInterval(() => {
-      if (messageIndex < statusMessages.length) {
-        setStatusMessage(statusMessages[messageIndex]);
-        messageIndex++;
-      }
-    }, 3000);
-
     try {
+      setStatusMessage("📤 Uploading file...");
+
+      console.log("🔑 Sending request with Authorization header...");
+      console.log("📍 URL:", API_ENDPOINTS.QUIZ.UPLOAD);
+
+      // Step 1: Start the generation
       const response = await fetch(API_ENDPOINTS.QUIZ.UPLOAD, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `Bearer ${token}`, // 🔧 Make sure this is correct
         },
         body: formData,
       });
 
+      console.log("📡 Response status:", response.status);
+
+      // 🔍 DEBUG: Log response details
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error("❌ Upload failed:", response.status, errorText);
+
+        if (response.status === 401) {
+          throw new Error("Session expired. Please login again.");
+        }
+
+        throw new Error(errorText || "Failed to upload file");
+      }
+
       const data = await response.json();
+      console.log("✅ Upload successful:", data);
 
-      clearInterval(progressInterval);
-      clearInterval(messageInterval);
-      setProgress(100);
+      const { generationId } = data;
+      setStatusMessage("✨ Generation started. Streaming results...");
 
-      if (response.ok) {
-        setStatusMessage("✅ Questions generated successfully!");
-        setMessage({
-          type: "success",
-          text: `Successfully generated ${data.questionsGenerated} ${difficulty} questions!`,
-        });
+      // Step 2: Connect to SSE stream with token in URL
+      const baseUrl = API_ENDPOINTS.QUIZ.UPLOAD.replace("/quiz/upload", "");
 
-        // Clear file and input but KEEP difficulty and other settings
-        setFile(null);
-        const fileInput = document.getElementById("file-upload");
-        if (fileInput) fileInput.value = "";
+      console.log("🔌 Connecting to SSE stream...");
+      console.log("📍 Stream URL:", `${baseUrl}/quiz/stream/${generationId}`);
 
-        // DON'T reset these anymore:
-        // setTopic('');
-        // setQuestionCount(10);
-        // setDifficulty('medium');
+      const eventSource = new EventSource(
+        `${baseUrl}/quiz/stream/${generationId}?token=${encodeURIComponent(token)}`,
+      );
 
-        setTimeout(() => {
-          if (onUploadComplete) {
-            onUploadComplete();
-          }
-        }, 1500);
-      } else {
+      eventSource.onopen = () => {
+        console.log("✅ SSE connection opened");
+      };
+
+      eventSource.onmessage = (event) => {
+        const streamData = JSON.parse(event.data);
+        console.log("📨 SSE message:", streamData.type);
+
+        if (streamData.type === "progress") {
+          setProgress(streamData.progress);
+          setStatusMessage(streamData.message);
+        } else if (streamData.type === "question") {
+          setQuestions((prev) => [...prev, streamData.question]);
+          setProgress(streamData.progress);
+          setStatusMessage(
+            `📝 Received ${streamData.questionNumber}/${streamData.totalQuestions} questions`,
+          );
+        } else if (streamData.type === "complete") {
+          console.log("✅ Generation complete!");
+          setProgress(100);
+          setStatusMessage("✅ All questions generated!");
+          setMessage({
+            type: "success",
+            text: `Successfully generated ${streamData.totalQuestions} ${difficulty} questions!`,
+          });
+          setUploading(false);
+          eventSource.close();
+
+          setFile(null);
+          const fileInput = document.getElementById("file-upload");
+          if (fileInput) fileInput.value = "";
+
+          setTimeout(() => {
+            if (onUploadComplete) {
+              onUploadComplete();
+            }
+          }, 1500);
+        } else if (streamData.type === "error") {
+          console.error("❌ SSE error:", streamData.message);
+          setStatusMessage("");
+          setMessage({
+            type: "error",
+            text: streamData.message,
+          });
+          setUploading(false);
+          eventSource.close();
+        }
+      };
+
+      eventSource.onerror = (error) => {
+        console.error("❌ SSE connection error:", error);
         setStatusMessage("");
         setMessage({
           type: "error",
-          text: data.message || "Failed to upload file",
+          text: "Connection error. Please try again.",
         });
-      }
+        setUploading(false);
+        eventSource.close();
+      };
     } catch (error) {
-      console.error("Upload error:", error);
-      clearInterval(progressInterval);
-      clearInterval(messageInterval);
+      console.error("❌ Upload error:", error);
       setStatusMessage("");
       setMessage({
         type: "error",
-        text: "An error occurred while uploading",
+        text: error.message || "An error occurred while uploading",
       });
-    } finally {
       setUploading(false);
       setProgress(0);
     }
@@ -156,7 +206,7 @@ export const FileUpload = ({ onUploadComplete, token }) => {
       <form onSubmit={handleSubmit} className="space-y-6">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            Course Material (PDF or TXT)
+            Course Material (PDF or TXT, max 40MB)
           </label>
           <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-[#065F46] transition-colors">
             <input
@@ -173,16 +223,21 @@ export const FileUpload = ({ onUploadComplete, token }) => {
             >
               <FileText className="w-12 h-12 text-gray-400 mb-2" />
               {file ? (
-                <span className="text-[#065F46] font-semibold">
-                  {file.name}
-                </span>
+                <div>
+                  <span className="text-[#065F46] font-semibold block">
+                    {file.name}
+                  </span>
+                  <span className="text-xs text-gray-500">
+                    {(file.size / 1024 / 1024).toFixed(2)} MB
+                  </span>
+                </div>
               ) : (
                 <>
                   <span className="text-gray-600">
                     Click to upload or drag and drop
                   </span>
                   <span className="text-sm text-gray-500 mt-1">
-                    PDF or TXT files only
+                    PDF or TXT files only (max 40MB)
                   </span>
                 </>
               )}
@@ -222,11 +277,6 @@ export const FileUpload = ({ onUploadComplete, token }) => {
             <span>50</span>
             <span>100</span>
           </div>
-          {questionCount > 30 && (
-            <p className="text-xs text-amber-600 mt-2">
-              ⚠️ Generating {questionCount} questions may take 2-3 minutes
-            </p>
-          )}
         </div>
 
         <div>
@@ -252,7 +302,6 @@ export const FileUpload = ({ onUploadComplete, token }) => {
           </div>
         </div>
 
-        {/* Progress Indicator */}
         {uploading && (
           <div className="bg-gradient-to-r from-blue-50 to-purple-50 border-2 border-blue-200 rounded-lg p-6">
             <div className="flex items-center gap-3 mb-4">
@@ -269,27 +318,13 @@ export const FileUpload = ({ onUploadComplete, token }) => {
                 </div>
               </div>
             </div>
-            <div className="flex items-start gap-2 text-xs text-gray-600">
-              <Sparkles className="w-4 h-4 text-purple-500 flex-shrink-0 mt-0.5" />
-              <p>
-                Our AI is analyzing your content and generating high-quality{" "}
-                {difficulty} questions that cover the entire material. This
-                ensures comprehensive practice!
+            {questions.length > 0 && (
+              <p className="text-sm font-bold text-[#065F46] mt-3 text-center">
+                📊 {questions.length} / {questionCount} questions received
               </p>
-            </div>
-            <p className="text-xs text-gray-500 mt-3 text-center">
-              Estimated time: {Math.ceil(questionCount / 10)} -{" "}
-              {Math.ceil(questionCount / 5)} minutes
-            </p>
+            )}
           </div>
         )}
-
-        <div className="bg-blue-50 border-2 border-blue-200 rounded-lg p-4">
-          <p className="text-sm text-blue-800">
-            ℹ️ <strong>Note:</strong> Uploading a new file will replace your
-            current questions.
-          </p>
-        </div>
 
         {message.text && (
           <div
@@ -310,9 +345,9 @@ export const FileUpload = ({ onUploadComplete, token }) => {
 
         <button
           type="submit"
-          disabled={uploading || !file || !topic}
+          disabled={uploading || !file || !topic || !token}
           className={`w-full py-4 rounded-lg font-semibold text-white transition-all ${
-            uploading || !file || !topic
+            uploading || !file || !topic || !token
               ? "bg-gray-400 cursor-not-allowed"
               : "bg-[#065F46] hover:bg-[#064e3b] shadow-lg hover:shadow-xl transform hover:scale-[1.02]"
           }`}
@@ -320,13 +355,31 @@ export const FileUpload = ({ onUploadComplete, token }) => {
           {uploading ? (
             <span className="flex items-center justify-center gap-2">
               <Loader2 className="animate-spin h-5 w-5" />
-              Generating {questionCount} Questions...
+              Generating Questions... ({questions.length}/{questionCount})
             </span>
+          ) : !token ? (
+            "Please Login First"
           ) : (
             "Generate Quiz Questions"
           )}
         </button>
       </form>
+
+      <style jsx>{`
+        @keyframes fadeIn {
+          from {
+            opacity: 0;
+            transform: translateY(-10px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+        .animate-fadeIn {
+          animation: fadeIn 0.3s ease-in;
+        }
+      `}</style>
     </div>
   );
 };

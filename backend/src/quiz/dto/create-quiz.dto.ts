@@ -9,7 +9,7 @@ import {
 export class CreateQuizDto {
   @IsString()
   @IsNotEmpty()
-  courseId: string;
+  userId: string;
 
   @IsString()
   @IsNotEmpty()

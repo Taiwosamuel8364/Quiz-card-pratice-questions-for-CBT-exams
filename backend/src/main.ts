@@ -16,66 +16,74 @@ async function bootstrap() {
   }
 
   // Get environment
-  const nodeEnv = configService.get<string>('NODE_ENV') || 'development';
-  
+  const nodeEnv = configService.get<string>("NODE_ENV") || "development";
+
   // Get frontend URLs from environment variable
-  const frontendUrls = configService.get<string>('FRONTEND_URL');
-  
+  const frontendUrls = configService.get<string>("FRONTEND_URL");
+
   let corsOptions;
-  
-  if (nodeEnv === 'production') {
-    // In production, use strict origins
-    const allowedOrigins = frontendUrls 
-      ? frontendUrls.split(',').map(url => url.trim())
+
+  if (nodeEnv === "production") {
+    const allowedOrigins = frontendUrls
+      ? frontendUrls.split(",").map((url) => url.trim())
       : [];
-    
+
     corsOptions = {
       origin: allowedOrigins,
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+      methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
       credentials: true,
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      allowedHeaders: ["Content-Type", "Authorization"],
     };
   } else {
-    // In development, allow any localhost
     corsOptions = {
       origin: (origin, callback) => {
-        // Allow requests with no origin (like mobile apps, Postman, etc.)
         if (!origin) return callback(null, true);
-        
-        // Allow all localhost origins in development
-        if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
+
+        if (
+          origin.startsWith("http://localhost") ||
+          origin.startsWith("http://127.0.0.1")
+        ) {
           return callback(null, true);
         }
-        
-        // Check against allowed origins if set
+
         if (frontendUrls) {
-          const allowedOrigins = frontendUrls.split(',').map(url => url.trim());
+          const allowedOrigins = frontendUrls
+            .split(",")
+            .map((url) => url.trim());
           if (allowedOrigins.includes(origin)) {
             return callback(null, true);
           }
         }
-        
-        callback(new Error('Not allowed by CORS'));
+
+        callback(new Error("Not allowed by CORS"));
       },
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+      methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
       credentials: true,
-      allowedHeaders: ['Content-Type', 'Authorization'],
+      allowedHeaders: ["Content-Type", "Authorization"],
     };
   }
 
   app.enableCors(corsOptions);
+
+  // Increase body size limit for file uploads
+  app.use((req, res, next) => {
+    if (req.path === "/api/quiz/upload") {
+      // For file upload endpoint, allow larger payloads
+      req.setTimeout(300000); // 5 minutes timeout for large files
+    }
+    next();
+  });
+
   app.useGlobalPipes(new ValidationPipe());
 
-  const port = configService.get<number>('PORT') || 4000;
-  await app.listen(port);
-  
+  const port = configService.get<number>("PORT") || 4000;
+
+  await app.listen(port, "0.0.0.0");
+
   console.log(`🚀 Backend running on: http://localhost:${port}`);
   console.log(`🌍 Environment: ${nodeEnv}`);
-  console.log(`📡 CORS: ${nodeEnv === 'production' ? 'Strict origins only' : 'Development mode - all localhost allowed'}`);
+  console.log(
+    `📡 CORS: ${nodeEnv === "production" ? "Strict origins only" : "Development mode - all localhost allowed"}`,
+  );
 }
 bootstrap();
-
-
-
-
-

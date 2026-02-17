@@ -1,67 +1,173 @@
 import {
   Controller,
-  Get,
   Post,
+  Get,
   Body,
-  Query,
-  UseInterceptors,
-  UploadedFile,
   UseGuards,
   Request,
+  Param,
+  UseInterceptors,
+  UploadedFile,
+  BadRequestException,
+  Sse,
+  Query,
+  UnauthorizedException,
+  Logger,
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
-import { QuizService } from "./quiz.service";
 import { JwtAuthGuard } from "../auth/jwt-auth.guard";
-import { multerConfig } from "./config/multer.config";
+import { QuizService } from "./quiz.service";
+import { diskStorage } from "multer";
+import { extname } from "path";
+import { v4 as uuidv4 } from "uuid";
+import { Observable } from "rxjs";
+import { MessageEvent } from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
 
 @Controller("api/quiz")
-@UseGuards(JwtAuthGuard)
 export class QuizController {
-  constructor(private readonly quizService: QuizService) {}
+  private readonly logger = new Logger(QuizController.name);
 
-  @Get("questions")
-  async getQuestions(
-    @Query("courseId") courseId: string,
-    @Request() req,
-  ) {
-    const userId = req.user.id;
-    return this.quizService.getQuizQuestions(`user-${userId}`, undefined);
-  }
+  constructor(
+    private readonly quizService: QuizService,
+    private readonly jwtService: JwtService,
+  ) {}
 
   @Post("upload")
-  @UseInterceptors(FileInterceptor("file", multerConfig))
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(
+    FileInterceptor("file", {
+      storage: diskStorage({
+        destination: "./uploads",
+        filename: (req, file, cb) => {
+          const uniqueName = `${uuidv4()}${extname(file.originalname)}`;
+          cb(null, uniqueName);
+        },
+      }),
+      limits: {
+        fileSize: 41943040, // 40MB
+      },
+      fileFilter: (req, file, cb) => {
+        if (
+          file.mimetype === "application/pdf" ||
+          file.mimetype === "text/plain"
+        ) {
+          cb(null, true);
+        } else {
+          cb(
+            new BadRequestException("Only PDF and TXT files are allowed"),
+            false,
+          );
+        }
+      },
+    }),
+  )
   async uploadFile(
-    @UploadedFile() file: any, // Changed to 'any' - simplest fix
-    @Body("topic") topic: string,
-    @Body("questionCount") questionCount: string,
-    @Body("difficulty") difficulty: "easy" | "medium" | "hard",
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: any,
     @Request() req,
   ) {
-    const userId = req.user.id;
+    if (!file) {
+      throw new BadRequestException("No file uploaded");
+    }
 
-    const validDifficulty: "easy" | "medium" | "hard" =
-      ["easy", "medium", "hard"].includes(difficulty)
-        ? difficulty
-        : "medium";
+    const { topic, questionCount = 10, difficulty = "medium" } = body;
 
-    return this.quizService.processUploadedFile({
+    if (!topic) {
+      throw new BadRequestException("Topic is required");
+    }
+
+    const userId = req.user.userId;
+
+    const generationId = await this.quizService.startQuizGeneration({
       file,
-      courseId: `user-${userId}`,
+      userId,
       topic,
-      questionCount: parseInt(questionCount) || 10,
-      difficulty: validDifficulty,
+      questionCount: parseInt(questionCount, 10),
+      difficulty: difficulty as "easy" | "medium" | "hard",
     });
+
+    return {
+      message: "Quiz generation started",
+      generationId,
+    };
+  }
+
+  @Sse("stream/:generationId")
+  streamQuizGeneration(
+    @Param("generationId") generationId: string,
+    @Query("token") token: string,
+  ): Observable<MessageEvent> {
+    if (!token) {
+      this.logger.error("SSE: No token provided");
+      throw new UnauthorizedException("Token is required");
+    }
+
+    try {
+      // Verify JWT token
+      const payload = this.jwtService.verify(token);
+
+      this.logger.log(
+        `SSE: Token verified. Payload: ${JSON.stringify(payload)}`,
+      );
+
+      // 🔧 Extract userId from 'sub' field (your auth.service uses 'sub')
+      const userId = payload.sub;
+
+      if (!userId) {
+        this.logger.error(
+          `SSE: No 'sub' field in token. Payload: ${JSON.stringify(payload)}`,
+        );
+        throw new UnauthorizedException(
+          "Invalid token: missing user identifier",
+        );
+      }
+
+      this.logger.log(
+        `SSE: User ${userId} connecting to generation ${generationId}`,
+      );
+
+      // Return the SSE stream
+      return this.quizService.streamQuizGeneration(userId, generationId);
+    } catch (error: any) {
+      this.logger.error(`SSE: Auth error: ${error.message}`);
+
+      if (error.name === "TokenExpiredError") {
+        throw new UnauthorizedException("Token expired. Please login again.");
+      }
+
+      if (error.name === "JsonWebTokenError") {
+        throw new UnauthorizedException("Invalid token");
+      }
+
+      throw new UnauthorizedException(
+        `Authentication failed: ${error.message}`,
+      );
+    }
+  }
+
+  @Get("questions")
+  @UseGuards(JwtAuthGuard)
+  async getQuizQuestions(@Request() req, @Query("limit") limit?: string) {
+    const userId = req.user.userId;
+    const limitNum = limit ? parseInt(limit, 10) : undefined;
+    return this.quizService.getQuizQuestions(userId, limitNum);
   }
 
   @Post("submit")
-  async submitAnswer(@Body() body: any, @Request() req) {
-    const userId = req.user.id;
+  @UseGuards(JwtAuthGuard)
+  async submitAnswer(
+    @Request() req,
+    @Body() body: { questionId: string; selectedAnswer: number },
+  ) {
+    const userId = req.user.userId;
     return this.quizService.submitAnswer(userId, body);
   }
 
   @Get("progress")
+  @UseGuards(JwtAuthGuard)
   async getUserProgress(@Request() req) {
-    const userId = req.user.id;
+    const userId = req.user.userId;
     return this.quizService.getUserProgress(userId);
   }
 }

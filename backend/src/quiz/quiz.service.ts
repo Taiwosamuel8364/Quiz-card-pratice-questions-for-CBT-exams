@@ -10,10 +10,21 @@ import { MastraService } from "../mastra/mastra.service";
 import { CreateQuizDto } from "./dto/create-quiz.dto";
 import * as fs from "fs/promises";
 import pdfParse from "pdf-parse";
+import { v4 as uuidv4 } from "uuid";
+import { Subject, Observable } from "rxjs";
+import { MessageEvent } from "@nestjs/common";
+
+interface GenerationStream {
+  subject: Subject<MessageEvent>;
+  status: "processing" | "completed" | "error";
+  userId: string; // 🔧 ADD: Store userId with the stream
+}
 
 @Injectable()
 export class QuizService {
   private readonly logger = new Logger(QuizService.name);
+  private activeGenerations = new Map<string, boolean>();
+  private generationStreams = new Map<string, GenerationStream>();
 
   constructor(
     @InjectModel(Question.name) private questionModel: Model<QuestionDocument>,
@@ -22,12 +33,16 @@ export class QuizService {
     private mastraService: MastraService,
   ) {}
 
-  async getQuizQuestions(courseId: string, limit?: number) {
+  async getQuizQuestions(userId: string, limit?: number) {
     try {
-      this.logger.log(`Fetching quiz questions for course: ${courseId}`);
+      this.logger.log(`Fetching quiz questions for user: ${userId}`);
 
-      const query = this.questionModel.find({ courseId }).select("-__v").lean();
-      
+      const query = this.questionModel
+        .find({ userId, isActive: true })
+        .select("-__v")
+        .sort({ createdAt: -1 })
+        .lean();
+
       if (limit && limit > 0) {
         query.limit(limit);
       }
@@ -35,12 +50,12 @@ export class QuizService {
       const questions = await query.exec();
 
       if (!questions || questions.length === 0) {
-        this.logger.warn(`No questions found for course ${courseId}`);
+        this.logger.warn(`No questions found for user ${userId}`);
         return [];
       }
 
-      this.logger.log(`Found ${questions.length} questions for course ${courseId}`);
-      
+      this.logger.log(`Found ${questions.length} questions for user ${userId}`);
+
       return questions.map((q) => ({
         _id: q._id.toString(),
         question: q.question,
@@ -56,20 +71,129 @@ export class QuizService {
     }
   }
 
-  async processUploadedFile(data: {
-    file: any; // Changed to 'any' - simplest fix
-    courseId: string;
+  async startQuizGeneration(data: {
+    file: any;
+    userId: string;
     topic: string;
     questionCount: number;
     difficulty?: "easy" | "medium" | "hard";
+  }): Promise<string> {
+    const { file, userId, topic, questionCount, difficulty = "medium" } = data;
+    const generationId = uuidv4();
+
+    if (this.activeGenerations.has(userId)) {
+      throw new Error(
+        "You already have a quiz generation in progress. Please wait for it to complete.",
+      );
+    }
+
+    const subject = new Subject<MessageEvent>();
+
+    // 🔧 FIX: Store userId with the stream
+    this.generationStreams.set(generationId, {
+      subject,
+      status: "processing",
+      userId, // Store the userId
+    });
+
+    this.activeGenerations.set(userId, true);
+
+    this.processUploadedFileStreaming({
+      file,
+      userId,
+      topic,
+      questionCount,
+      difficulty,
+      generationId,
+      subject,
+    }).catch((error) => {
+      this.logger.error(`Error in background processing: ${error.message}`);
+      const stream = this.generationStreams.get(generationId);
+      if (stream) {
+        stream.status = "error";
+        stream.subject.next({
+          data: {
+            type: "error",
+            message: error.message,
+          },
+        } as MessageEvent);
+        stream.subject.complete();
+      }
+      this.activeGenerations.delete(userId);
+    });
+
+    return generationId;
+  }
+
+  streamQuizGeneration(
+    userId: string,
+    generationId: string,
+  ): Observable<MessageEvent> {
+    const stream = this.generationStreams.get(generationId);
+
+    if (!stream) {
+      const errorSubject = new Subject<MessageEvent>();
+      errorSubject.next({
+        data: {
+          type: "error",
+          message: "Generation not found or expired",
+        },
+      } as MessageEvent);
+      errorSubject.complete();
+      return errorSubject.asObservable();
+    }
+
+    // 🔧 FIX: Verify that the userId matches
+    if (stream.userId !== userId) {
+      const errorSubject = new Subject<MessageEvent>();
+      errorSubject.next({
+        data: {
+          type: "error",
+          message: "Unauthorized: This generation belongs to another user",
+        },
+      } as MessageEvent);
+      errorSubject.complete();
+      return errorSubject.asObservable();
+    }
+
+    return stream.subject.asObservable();
+  }
+
+  private async processUploadedFileStreaming(data: {
+    file: any;
+    userId: string;
+    topic: string;
+    questionCount: number;
+    difficulty: "easy" | "medium" | "hard";
+    generationId: string;
+    subject: Subject<MessageEvent>;
   }) {
-    const { file, courseId, topic, questionCount, difficulty = 'medium' } = data;
+    const {
+      file,
+      userId,
+      topic,
+      questionCount,
+      difficulty,
+      generationId,
+      subject,
+    } = data;
 
     try {
-      this.logger.log(`Processing file: ${file.filename} with difficulty: ${difficulty}`);
+      this.logger.log(
+        `[${generationId}] Processing file: ${file.filename} for user ${userId}`,
+      );
 
-      const deleteResult = await this.questionModel.deleteMany({ courseId }).exec();
-      this.logger.log(`🗑️ Deleted ${deleteResult.deletedCount} previous questions for course ${courseId}`);
+      if (!userId) {
+        throw new Error("UserId is required for question generation");
+      }
+
+      subject.next({
+        data: {
+          type: "progress",
+          message: "Extracting text from file...",
+          progress: 10,
+        },
+      } as MessageEvent);
 
       let extractedText = "";
 
@@ -85,21 +209,122 @@ export class QuizService {
         );
       }
 
-      this.logger.log(`Extracted ${extractedText.length} characters from file`);
-
+      this.logger.log(
+        `[${generationId}] Extracted ${extractedText.length} characters from file`,
+      );
       await fs.unlink(file.path);
 
-      // Generate questions using Mastra AI with difficulty
-      const questions = await this.mastraService.generateQuizQuestions(
-        extractedText,
+      // 🔧 FIX: Limit content size to prevent token overflow
+      const MAX_CONTENT_LENGTH = 15000; // ~3750 tokens
+      const contentToSend = extractedText.substring(0, MAX_CONTENT_LENGTH);
+
+      if (extractedText.length > MAX_CONTENT_LENGTH) {
+        this.logger.warn(
+          `[${generationId}] Content truncated from ${extractedText.length} to ${MAX_CONTENT_LENGTH} chars`,
+        );
+
+        subject.next({
+          data: {
+            type: "progress",
+            message: `Content truncated to fit AI context. Using first ${MAX_CONTENT_LENGTH} characters...`,
+            progress: 15,
+          },
+        } as MessageEvent);
+      }
+
+      // 🔧 FIX: Adjust question count based on content length
+      // Rule: Max 1 question per 300 characters of content
+      const maxRecommendedQuestions = Math.floor(contentToSend.length / 300);
+      const adjustedQuestionCount = Math.min(
         questionCount,
+        maxRecommendedQuestions,
+        50,
+      ); // Cap at 50
+
+      if (adjustedQuestionCount < questionCount) {
+        this.logger.warn(
+          `[${generationId}] Reduced question count from ${questionCount} to ${adjustedQuestionCount} based on content length`,
+        );
+
+        subject.next({
+          data: {
+            type: "progress",
+            message: `Adjusted to ${adjustedQuestionCount} questions based on content size...`,
+            progress: 18,
+          },
+        } as MessageEvent);
+      }
+
+      subject.next({
+        data: {
+          type: "progress",
+          message: `Generating ${adjustedQuestionCount} questions with AI...`,
+          progress: 20,
+        },
+      } as MessageEvent);
+
+      // Generate questions with adjusted count
+      const questions = await this.mastraService.generateQuizQuestions(
+        contentToSend, // Use truncated content
+        adjustedQuestionCount, // Use adjusted count
         difficulty,
       );
 
-      const savedQuestions = [];
-      for (const q of questions) {
-        const question = new this.questionModel({
-          courseId,
+      this.logger.log(
+        `[${generationId}] AI generated ${questions.length} questions`,
+      );
+
+      // 🔧 FIX: Warn user if fewer questions were generated
+      if (questions.length < questionCount) {
+        subject.next({
+          data: {
+            type: "progress",
+            message: `Generated ${questions.length} questions (requested ${questionCount}). This may be due to content length limitations.`,
+            progress: 65,
+          },
+        } as MessageEvent);
+      }
+
+      subject.next({
+        data: {
+          type: "progress",
+          message: "Deactivating old questions...",
+          progress: 60,
+        },
+      } as MessageEvent);
+
+      const deactivateResult = await this.questionModel
+        .updateMany({ userId, isActive: true }, { $set: { isActive: false } })
+        .exec();
+
+      this.logger.log(
+        `[${generationId}] Deactivated ${deactivateResult.modifiedCount} old questions`,
+      );
+
+      subject.next({
+        data: {
+          type: "progress",
+          message: "Saving questions in parallel...",
+          progress: 70,
+        },
+      } as MessageEvent);
+
+      const startTime = Date.now();
+
+      const questionPromises = questions.map((q) => {
+        if (
+          !userId ||
+          !topic ||
+          !q.question ||
+          !q.options ||
+          q.correctAnswer === undefined
+        ) {
+          this.logger.error(`[${generationId}] Invalid question data`);
+          throw new Error("Invalid question data - missing required fields");
+        }
+
+        return this.questionModel.create({
+          userId,
           topic,
           question: q.question,
           options: q.options,
@@ -107,27 +332,98 @@ export class QuizService {
           explanation: q.explanation,
           difficulty: q.difficulty || difficulty,
           sourceFile: file.originalname,
+          generationId,
+          isActive: true,
         });
-        const saved = await question.save();
-        savedQuestions.push(saved);
-      }
+      });
+
+      const savedQuestions = await Promise.all(questionPromises);
+      const saveTime = Date.now() - startTime;
 
       this.logger.log(
-        `✅ Generated and saved ${savedQuestions.length} ${difficulty} questions`,
+        `[${generationId}] ⚡ Saved ${savedQuestions.length} questions in parallel (${saveTime}ms)`,
       );
 
-      return {
-        success: true,
-        message: `Successfully generated ${savedQuestions.length} ${difficulty} questions from ${file.originalname}`,
-        courseId,
-        topic,
-        difficulty,
-        questionsGenerated: savedQuestions.length,
-        deletedCount: deleteResult.deletedCount,
-        questions: savedQuestions,
-      };
+      const streamPromises = savedQuestions.map((saved, index) => {
+        const progress = 70 + ((index + 1) / savedQuestions.length) * 30;
+
+        return new Promise<void>((resolve) => {
+          subject.next({
+            data: {
+              type: "question",
+              question: {
+                _id: saved._id.toString(),
+                question: saved.question,
+                options: saved.options,
+                correctAnswer: saved.correctAnswer,
+                explanation: saved.explanation,
+                topic: saved.topic,
+                difficulty: saved.difficulty,
+              },
+              progress: Math.min(progress, 99),
+              questionNumber: index + 1,
+              totalQuestions: savedQuestions.length,
+            },
+          } as MessageEvent);
+
+          resolve();
+        });
+      });
+
+      await Promise.all(streamPromises);
+
+      this.logger.log(
+        `[${generationId}] ✅ Streamed all ${savedQuestions.length} questions`,
+      );
+
+      subject.next({
+        data: {
+          type: "complete",
+          message: `Successfully generated ${savedQuestions.length} questions${
+            savedQuestions.length < questionCount
+              ? ` (requested ${questionCount}, limited by content size)`
+              : ""
+          }`,
+          totalQuestions: savedQuestions.length,
+          requestedQuestions: questionCount,
+          progress: 100,
+          saveTimeMs: saveTime,
+        },
+      } as MessageEvent);
+
+      subject.complete();
+
+      const stream = this.generationStreams.get(generationId);
+      if (stream) {
+        stream.status = "completed";
+      }
+      this.activeGenerations.delete(userId);
+
+      setTimeout(() => {
+        this.generationStreams.delete(generationId);
+        this.logger.log(`[${generationId}] Cleaned up generation stream`);
+      }, 60000);
+
+      this.logger.log(
+        `[${generationId}] ✅ Completed successfully in ${saveTime}ms`,
+      );
     } catch (error) {
-      this.logger.error(`Error processing file: ${error.message}`);
+      this.logger.error(`[${generationId}] Error: ${error.message}`);
+      this.logger.error(`[${generationId}] Error stack:`, error.stack);
+
+      subject.next({
+        data: {
+          type: "error",
+          message: error.message,
+        },
+      } as MessageEvent);
+      subject.complete();
+
+      const stream = this.generationStreams.get(generationId);
+      if (stream) {
+        stream.status = "error";
+      }
+      this.activeGenerations.delete(userId);
 
       try {
         await fs.unlink(file.path);
@@ -137,16 +433,20 @@ export class QuizService {
     }
   }
 
-  /**
-   * Submit an answer and update user progress
-   */
-  async submitAnswer(userId: string, body: { questionId: string; selectedAnswer: number }) {
+  async submitAnswer(
+    userId: string,
+    body: { questionId: string; selectedAnswer: number },
+  ) {
     const { questionId, selectedAnswer } = body;
 
     try {
       const question = await this.questionModel.findById(questionId);
       if (!question) {
-        throw new NotFoundException('Question not found');
+        throw new NotFoundException("Question not found");
+      }
+
+      if (question.userId !== userId) {
+        throw new NotFoundException("Question not found");
       }
 
       const isCorrect = selectedAnswer === question.correctAnswer;
@@ -210,38 +510,25 @@ export class QuizService {
     }
   }
 
-  async createQuiz(createQuizDto: CreateQuizDto) {
-    const { courseId, content, questionCount } = createQuizDto;
-
+  async cleanupOldQuestions() {
     try {
-      this.logger.log(`Creating quiz for course ${courseId}`);
+      const sevenDaysAgo = new Date();
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
-      const questions = await this.mastraService.generateQuizQuestions(
-        content,
-        questionCount || 10,
+      const result = await this.questionModel
+        .deleteMany({
+          isActive: false,
+          updatedAt: { $lt: sevenDaysAgo },
+        })
+        .exec();
+
+      this.logger.log(
+        `🧹 Cleaned up ${result.deletedCount} old inactive questions`,
       );
-
-      const savedQuestions = [];
-      for (const q of questions) {
-        const question = new this.questionModel({
-          courseId,
-          ...q,
-        });
-        const saved = await question.save();
-        savedQuestions.push(saved);
-      }
-
-      this.logger.log(`Created ${savedQuestions.length} questions for course ${courseId}`);
-
-      return {
-        success: true,
-        courseId,
-        questionsGenerated: savedQuestions.length,
-        questions: savedQuestions,
-      };
+      return result.deletedCount;
     } catch (error) {
-      this.logger.error(`Error creating quiz: ${error.message}`);
-      throw error;
+      this.logger.error(`Error cleaning up old questions: ${error.message}`);
+      return 0;
     }
   }
 }

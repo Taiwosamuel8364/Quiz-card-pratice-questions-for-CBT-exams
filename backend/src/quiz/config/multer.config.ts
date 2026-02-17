@@ -1,23 +1,28 @@
-import { diskStorage } from 'multer';
-import { extname } from 'path';
+import { diskStorage } from "multer";
+import { extname } from "path";
 
 export const multerConfig = {
   storage: diskStorage({
-    destination: './uploads',
-    filename: (req, file, callback) => {
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+    destination: "./uploads",
+    filename: (req, file, cb) => {
+      const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
       const ext = extname(file.originalname);
-      callback(null, `${file.fieldname}-${uniqueSuffix}${ext}`);
+      const filename = `${file.fieldname}-${uniqueSuffix}${ext}`;
+      cb(null, filename);
     },
   }),
-  fileFilter: (req, file, callback) => {
-    if (file.mimetype === 'application/pdf' || file.mimetype === 'text/plain') {
-      callback(null, true);
-    } else {
-      callback(new Error('Only PDF and TXT files are allowed'), false);
-    }
-  },
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB
+    fileSize: 40 * 1024 * 1024, // 40MB in bytes
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedMimeTypes = ["application/pdf", "text/plain"];
+    if (allowedMimeTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(
+        new Error("Invalid file type. Only PDF and TXT files are allowed."),
+        false,
+      );
+    }
   },
 };
