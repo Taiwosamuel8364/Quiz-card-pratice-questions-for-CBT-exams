@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "@google/generative-ai": "^0.2.1",
-    "@mastra/core": "^0.1.0",
     "@nestjs/common": "^10.0.0",
     "@nestjs/config": "^3.1.1",
     "@nestjs/core": "^10.0.0",
