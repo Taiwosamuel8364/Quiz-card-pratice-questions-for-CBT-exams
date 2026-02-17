@@ -7,17 +7,29 @@ import {
   UserProgressDocument,
 } from "./schemas/user-progress.schema";
 import { MastraService } from "../mastra/mastra.service";
-import { CreateQuizDto } from "./dto/create-quiz.dto";
 import * as fs from "fs/promises";
 import pdfParse from "pdf-parse";
 import { v4 as uuidv4 } from "uuid";
 import { Subject, Observable } from "rxjs";
 import { MessageEvent } from "@nestjs/common";
 
+// 🔧 FIX: Define MulterFile interface
+interface MulterFile {
+  fieldname: string;
+  originalname: string;
+  encoding: string;
+  mimetype: string;
+  size: number;
+  destination: string;
+  filename: string;
+  path: string;
+  buffer: Buffer;
+}
+
 interface GenerationStream {
   subject: Subject<MessageEvent>;
   status: "processing" | "completed" | "error";
-  userId: string; // 🔧 ADD: Store userId with the stream
+  userId: string;
 }
 
 @Injectable()
@@ -72,7 +84,7 @@ export class QuizService {
   }
 
   async startQuizGeneration(data: {
-    file: any;
+    file: MulterFile; // 🔧 CHANGED: Use MulterFile interface
     userId: string;
     topic: string;
     questionCount: number;
@@ -89,11 +101,10 @@ export class QuizService {
 
     const subject = new Subject<MessageEvent>();
 
-    // 🔧 FIX: Store userId with the stream
     this.generationStreams.set(generationId, {
       subject,
       status: "processing",
-      userId, // Store the userId
+      userId,
     });
 
     this.activeGenerations.set(userId, true);
@@ -143,7 +154,6 @@ export class QuizService {
       return errorSubject.asObservable();
     }
 
-    // 🔧 FIX: Verify that the userId matches
     if (stream.userId !== userId) {
       const errorSubject = new Subject<MessageEvent>();
       errorSubject.next({
@@ -160,7 +170,7 @@ export class QuizService {
   }
 
   private async processUploadedFileStreaming(data: {
-    file: any;
+    file: MulterFile; // 🔧 CHANGED: Use MulterFile interface
     userId: string;
     topic: string;
     questionCount: number;
@@ -214,76 +224,23 @@ export class QuizService {
       );
       await fs.unlink(file.path);
 
-      // 🔧 FIX: Limit content size to prevent token overflow
-      const MAX_CONTENT_LENGTH = 15000; // ~3750 tokens
-      const contentToSend = extractedText.substring(0, MAX_CONTENT_LENGTH);
-
-      if (extractedText.length > MAX_CONTENT_LENGTH) {
-        this.logger.warn(
-          `[${generationId}] Content truncated from ${extractedText.length} to ${MAX_CONTENT_LENGTH} chars`,
-        );
-
-        subject.next({
-          data: {
-            type: "progress",
-            message: `Content truncated to fit AI context. Using first ${MAX_CONTENT_LENGTH} characters...`,
-            progress: 15,
-          },
-        } as MessageEvent);
-      }
-
-      // 🔧 FIX: Adjust question count based on content length
-      // Rule: Max 1 question per 300 characters of content
-      const maxRecommendedQuestions = Math.floor(contentToSend.length / 300);
-      const adjustedQuestionCount = Math.min(
-        questionCount,
-        maxRecommendedQuestions,
-        50,
-      ); // Cap at 50
-
-      if (adjustedQuestionCount < questionCount) {
-        this.logger.warn(
-          `[${generationId}] Reduced question count from ${questionCount} to ${adjustedQuestionCount} based on content length`,
-        );
-
-        subject.next({
-          data: {
-            type: "progress",
-            message: `Adjusted to ${adjustedQuestionCount} questions based on content size...`,
-            progress: 18,
-          },
-        } as MessageEvent);
-      }
-
       subject.next({
         data: {
           type: "progress",
-          message: `Generating ${adjustedQuestionCount} questions with AI...`,
+          message: "Generating questions with AI...",
           progress: 20,
         },
       } as MessageEvent);
 
-      // Generate questions with adjusted count
       const questions = await this.mastraService.generateQuizQuestions(
-        contentToSend, // Use truncated content
-        adjustedQuestionCount, // Use adjusted count
+        extractedText,
+        questionCount,
         difficulty,
       );
 
       this.logger.log(
         `[${generationId}] AI generated ${questions.length} questions`,
       );
-
-      // 🔧 FIX: Warn user if fewer questions were generated
-      if (questions.length < questionCount) {
-        subject.next({
-          data: {
-            type: "progress",
-            message: `Generated ${questions.length} questions (requested ${questionCount}). This may be due to content length limitations.`,
-            progress: 65,
-          },
-        } as MessageEvent);
-      }
 
       subject.next({
         data: {
@@ -319,7 +276,13 @@ export class QuizService {
           !q.options ||
           q.correctAnswer === undefined
         ) {
-          this.logger.error(`[${generationId}] Invalid question data`);
+          this.logger.error(`[${generationId}] Invalid question data:`, {
+            hasUserId: !!userId,
+            hasTopic: !!topic,
+            hasQuestion: !!q.question,
+            hasOptions: !!q.options,
+            hasCorrectAnswer: q.correctAnswer !== undefined,
+          });
           throw new Error("Invalid question data - missing required fields");
         }
 
@@ -338,8 +301,8 @@ export class QuizService {
       });
 
       const savedQuestions = await Promise.all(questionPromises);
-      const saveTime = Date.now() - startTime;
 
+      const saveTime = Date.now() - startTime;
       this.logger.log(
         `[${generationId}] ⚡ Saved ${savedQuestions.length} questions in parallel (${saveTime}ms)`,
       );
@@ -379,13 +342,8 @@ export class QuizService {
       subject.next({
         data: {
           type: "complete",
-          message: `Successfully generated ${savedQuestions.length} questions${
-            savedQuestions.length < questionCount
-              ? ` (requested ${questionCount}, limited by content size)`
-              : ""
-          }`,
+          message: `Successfully generated ${savedQuestions.length} questions`,
           totalQuestions: savedQuestions.length,
-          requestedQuestions: questionCount,
           progress: 100,
           saveTimeMs: saveTime,
         },

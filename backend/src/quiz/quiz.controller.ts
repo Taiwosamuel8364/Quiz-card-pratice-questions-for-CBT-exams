@@ -24,6 +24,19 @@ import { Observable } from "rxjs";
 import { MessageEvent } from "@nestjs/common";
 import { JwtService } from "@nestjs/jwt";
 
+// 🔧 FIX: Import the File type directly from multer
+interface MulterFile {
+  fieldname: string;
+  originalname: string;
+  encoding: string;
+  mimetype: string;
+  size: number;
+  destination: string;
+  filename: string;
+  path: string;
+  buffer: Buffer;
+}
+
 @Controller("api/quiz")
 export class QuizController {
   private readonly logger = new Logger(QuizController.name);
@@ -63,7 +76,7 @@ export class QuizController {
     }),
   )
   async uploadFile(
-    @UploadedFile() file: Express.Multer.File,
+    @UploadedFile() file: MulterFile, // 🔧 CHANGED: Use custom interface
     @Body() body: any,
     @Request() req,
   ) {
@@ -104,14 +117,12 @@ export class QuizController {
     }
 
     try {
-      // Verify JWT token
       const payload = this.jwtService.verify(token);
 
       this.logger.log(
         `SSE: Token verified. Payload: ${JSON.stringify(payload)}`,
       );
 
-      // 🔧 Extract userId from 'sub' field (your auth.service uses 'sub')
       const userId = payload.sub;
 
       if (!userId) {
@@ -127,7 +138,6 @@ export class QuizController {
         `SSE: User ${userId} connecting to generation ${generationId}`,
       );
 
-      // Return the SSE stream
       return this.quizService.streamQuizGeneration(userId, generationId);
     } catch (error: any) {
       this.logger.error(`SSE: Auth error: ${error.message}`);
