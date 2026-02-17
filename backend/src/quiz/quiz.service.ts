@@ -8,7 +8,6 @@ import {
 } from "./schemas/user-progress.schema";
 import { MastraService } from "../mastra/mastra.service";
 import { CreateQuizDto } from "./dto/create-quiz.dto";
-import { SubmitAnswerDto } from "./dto/submit-answer.dto";
 import * as fs from "fs/promises";
 import pdfParse from "pdf-parse";
 
@@ -23,16 +22,12 @@ export class QuizService {
     private mastraService: MastraService,
   ) {}
 
-  /**
-   * Get quiz questions for a specific course
-   */
   async getQuizQuestions(courseId: string, limit?: number) {
     try {
       this.logger.log(`Fetching quiz questions for course: ${courseId}`);
 
       const query = this.questionModel.find({ courseId }).select("-__v").lean();
       
-      // Only apply limit if provided
       if (limit && limit > 0) {
         query.limit(limit);
       }
@@ -61,26 +56,21 @@ export class QuizService {
     }
   }
 
-  /**
-   * Process uploaded file and generate questions
-   */
   async processUploadedFile(data: {
-    file: Express.Multer.File;
+    file: any; // Changed to 'any' - simplest fix
     courseId: string;
     topic: string;
     questionCount: number;
-    difficulty?: "easy" | "medium" | "hard"; // Fixed type
+    difficulty?: "easy" | "medium" | "hard";
   }) {
     const { file, courseId, topic, questionCount, difficulty = 'medium' } = data;
 
     try {
       this.logger.log(`Processing file: ${file.filename} with difficulty: ${difficulty}`);
 
-      // ALWAYS clear previous questions before generating new ones
       const deleteResult = await this.questionModel.deleteMany({ courseId }).exec();
       this.logger.log(`🗑️ Deleted ${deleteResult.deletedCount} previous questions for course ${courseId}`);
 
-      // Extract text from file
       let extractedText = "";
 
       if (file.mimetype === "application/pdf") {
@@ -97,17 +87,15 @@ export class QuizService {
 
       this.logger.log(`Extracted ${extractedText.length} characters from file`);
 
-      // Clean up uploaded file
       await fs.unlink(file.path);
 
       // Generate questions using Mastra AI with difficulty
       const questions = await this.mastraService.generateQuizQuestions(
         extractedText,
         questionCount,
-        difficulty, // Now properly typed
+        difficulty,
       );
 
-      // Save questions to database
       const savedQuestions = [];
       for (const q of questions) {
         const question = new this.questionModel({
@@ -141,7 +129,6 @@ export class QuizService {
     } catch (error) {
       this.logger.error(`Error processing file: ${error.message}`);
 
-      // Clean up file if it still exists
       try {
         await fs.unlink(file.path);
       } catch {}
@@ -157,7 +144,6 @@ export class QuizService {
     const { questionId, selectedAnswer } = body;
 
     try {
-      // Find the question
       const question = await this.questionModel.findById(questionId);
       if (!question) {
         throw new NotFoundException('Question not found');
@@ -165,7 +151,6 @@ export class QuizService {
 
       const isCorrect = selectedAnswer === question.correctAnswer;
 
-      // Update or create user progress
       let progress = await this.userProgressModel.findOne({ userId });
 
       if (!progress) {
@@ -200,9 +185,6 @@ export class QuizService {
     }
   }
 
-  /**
-   * Get user progress
-   */
   async getUserProgress(userId: string) {
     try {
       const progress = await this.userProgressModel.findOne({ userId });
@@ -228,9 +210,6 @@ export class QuizService {
     }
   }
 
-  /**
-   * Generate quiz from user input
-   */
   async createQuiz(createQuizDto: CreateQuizDto) {
     const { courseId, content, questionCount } = createQuizDto;
 
