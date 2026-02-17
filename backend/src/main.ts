@@ -1,11 +1,13 @@
 import { NestFactory } from "@nestjs/core";
 import { ValidationPipe } from "@nestjs/common";
 import { AppModule } from "./app.module";
+import { ConfigService } from "@nestjs/config";
 import * as fs from "fs";
 import * as path from "path";
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  const configService = app.get(ConfigService);
 
   // Create uploads directory if it doesn't exist
   const uploadsDir = path.join(process.cwd(), "uploads");
@@ -13,25 +15,63 @@ async function bootstrap() {
     fs.mkdirSync(uploadsDir, { recursive: true });
   }
 
-  // Enable CORS - UPDATE PORTS HERE
-  app.enableCors({
-    origin: [
-      'http://localhost:3000',  // ← Your new frontend port
-      'http://localhost:5173',  // Keep old one just in case
-      'http://localhost:5174',
-    ],
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    credentials: true,
-    allowedHeaders: ['Content-Type', 'Authorization'],
-  });
+  // Get environment
+  const nodeEnv = configService.get<string>('NODE_ENV') || 'development';
+  
+  // Get frontend URLs from environment variable
+  const frontendUrls = configService.get<string>('FRONTEND_URL');
+  
+  let corsOptions;
+  
+  if (nodeEnv === 'production') {
+    // In production, use strict origins
+    const allowedOrigins = frontendUrls 
+      ? frontendUrls.split(',').map(url => url.trim())
+      : [];
+    
+    corsOptions = {
+      origin: allowedOrigins,
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+      credentials: true,
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    };
+  } else {
+    // In development, allow any localhost
+    corsOptions = {
+      origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps, Postman, etc.)
+        if (!origin) return callback(null, true);
+        
+        // Allow all localhost origins in development
+        if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
+          return callback(null, true);
+        }
+        
+        // Check against allowed origins if set
+        if (frontendUrls) {
+          const allowedOrigins = frontendUrls.split(',').map(url => url.trim());
+          if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
+          }
+        }
+        
+        callback(new Error('Not allowed by CORS'));
+      },
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+      credentials: true,
+      allowedHeaders: ['Content-Type', 'Authorization'],
+    };
+  }
 
+  app.enableCors(corsOptions);
   app.useGlobalPipes(new ValidationPipe());
 
-  const port = process.env.PORT || 4000; // ← Your new backend port
+  const port = configService.get<number>('PORT') || 4000;
   await app.listen(port);
   
   console.log(`🚀 Backend running on: http://localhost:${port}`);
-  console.log(`📡 CORS enabled for: http://localhost:3000`);
+  console.log(`🌍 Environment: ${nodeEnv}`);
+  console.log(`📡 CORS: ${nodeEnv === 'production' ? 'Strict origins only' : 'Development mode - all localhost allowed'}`);
 }
 bootstrap();
 
